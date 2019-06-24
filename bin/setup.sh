@@ -14,7 +14,7 @@ git fetch
 git branch -f $branch_name origin/$branch_name
 hub create $repo_name -p
 git remote add $gh_username git@github.com:$repo_name.git 2>&1 || true
-git push $gh_username master
+git push $gh_username develop
 git push $gh_username $branch_name:refs/heads/$branch_name
 
 open_browser() {
