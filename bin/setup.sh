@@ -4,7 +4,7 @@ set -e
 
 gh_username=$1
 repo_name=indigo-ag/api-interview-$gh_username
-branch_name=order-null-hedge
+branch_name=schema-retry
 
 echo $gh_username
 
