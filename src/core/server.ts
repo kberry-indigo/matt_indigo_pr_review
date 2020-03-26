@@ -14,10 +14,12 @@ export enum ServerLifeCycle {
   CONNECTORS_READY = 'CONNECTORS_READY',
   MIDDLEWARE_READY = 'MIDDLEWARE_READY',
   STARTED = 'SERVER_STARTED',
-  STOPPED = 'SERVER_STOPPED'
+  STOPPED = 'SERVER_STOPPED',
+  REMOTE_SCHEMAS_FETCHING = 'REMOTE_SCHEMAS_FETCHING',
+  REMOTE_SCHEMAS_FETCHED = 'REMOTE_SCHEMAS_FETCHED'
 }
 
-export const MIDDLEWARE_READY_FUNC = 'isMiddlewareReady';
+export const APPLICATION_READY_FUNC = 'isApplicationReady';
 
 export class Server {
   public readonly app: express.Application;
@@ -25,26 +27,44 @@ export class Server {
   private readonly connectors: Array<Initializable<void>>;
   private readonly middleware: Array<Initializable<express.Application>>;
 
-  private lifeCycle: ServerLifeCycle[];
+  private lifeCycleHistory: ServerLifeCycle[];
+
+  private lifeCyclePending: ServerLifeCycle[];
+
   private httpServer: http.Server;
 
   constructor(connectors: Array<Initializable<void>>, middleware: Array<Initializable<express.Application>>) {
     this.connectors = connectors;
     this.middleware = middleware;
-    this.lifeCycle = [ServerLifeCycle.STOPPED];
+    this.lifeCycleHistory = [ServerLifeCycle.STOPPED];
+    this.lifeCyclePending = [];
     this.app = express();
 
     // can be referenced in other middleware to determine if application has initilized
-    this.app.set(MIDDLEWARE_READY_FUNC, () => this.isMiddlewareReady);
+    this.app.set(APPLICATION_READY_FUNC, () => this.isApplicationReady);
+
+    this.removePendingSchema = this.removePendingSchema.bind(this);
   }
 
-  get isMiddlewareReady() {
-    return this.lifeCycle.includes(ServerLifeCycle.MIDDLEWARE_READY);
+  get isApplicationReady() {
+    const isSchemaPending = this.lifeCyclePending.includes(ServerLifeCycle.REMOTE_SCHEMAS_FETCHING);
+    const hasMiddlewareLoaded = this.lifeCycleHistory.includes(ServerLifeCycle.MIDDLEWARE_READY);
+
+    return !isSchemaPending && hasMiddlewareLoaded;
   }
 
   start(config: ServerConfig) {
-    this.lifeCycle = [];
+    this.lifeCycleHistory = [];
+
     this.on(ServerLifeCycle.MIDDLEWARE_READY).do(this.logStatus);
+
+    this.on(ServerLifeCycle.REMOTE_SCHEMAS_FETCHED).do(this.removePendingSchema);
+
+    this.on(ServerLifeCycle.REMOTE_SCHEMAS_FETCHING).do(() => {
+      log.info('Remote Schema Fetching');
+      this.lifeCyclePending.push(ServerLifeCycle.REMOTE_SCHEMAS_FETCHING);
+    });
+
     this.startHttpServer(config);
     Promise.all(this.connectors.map(c => c.initialize()))
       .then(() => {
@@ -63,7 +83,7 @@ export class Server {
   stop() {
     if (this.httpServer) {
       this.httpServer.close();
-      this.lifeCycle = [];
+      this.lifeCycleHistory = [];
       this.publish(ServerLifeCycle.STOPPED);
     } else {
       log.warn('No http server to stop');
@@ -79,7 +99,19 @@ export class Server {
   }
 
   getLifeCycleStatus(): Readonly<ServerLifeCycle[]> {
-    return this.lifeCycle;
+    return this.lifeCycleHistory;
+  }
+
+  private removePendingSchema() {
+    const fetchingPos = this.lifeCyclePending.indexOf(ServerLifeCycle.REMOTE_SCHEMAS_FETCHING);
+    this.lifeCyclePending.splice(fetchingPos, 1);
+
+    this.lifeCycleHistory.push(ServerLifeCycle.REMOTE_SCHEMAS_FETCHED);
+
+    // If not pending schemas notify of ready
+    if (!this.lifeCycleHistory.some(cycle => cycle === ServerLifeCycle.REMOTE_SCHEMAS_FETCHING)) {
+      log.info('Remote Schema Ready');
+    }
   }
 
   private startHttpServer(config: ServerConfig) {
@@ -99,7 +131,7 @@ export class Server {
 
   private publish(lifeCycleEvent: ServerLifeCycle) {
     pubsub.publish(`IA.api.server.${lifeCycleEvent}`, this);
-    this.lifeCycle.push(lifeCycleEvent);
+    this.lifeCycleHistory.push(lifeCycleEvent);
   }
 
   private logStatus(server: Server): void {
@@ -107,5 +139,4 @@ export class Server {
     log.info(`Server listening on http://localhost:${address.port}`);
     log.info(`GraphQL playground listening on http://localhost:${address.port}/graphql`);
   }
-
 }

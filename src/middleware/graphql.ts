@@ -9,12 +9,15 @@ import { applyMiddleware, IMiddleware, IMiddlewareGenerator } from 'graphql-midd
 import { introspectSchema, makeExecutableSchema, makeRemoteExecutableSchema, mergeSchemas } from 'graphql-tools';
 import { IResolvers } from 'graphql-tools/dist/Interfaces';
 import { GraphQLError } from 'graphql/error/GraphQLError';
-import _ from 'lodash';
+import * as _ from 'lodash';
+import pubsub from 'pubsub-js';
 
 import { Initializable } from '@indigo-ag/common';
 
-import { Context, ErrorReporter, NestedError, User } from '../core';
+import { Context, ErrorReporter, User, Retry, NestedError } from '../core';
 import { GraphQLErrorFormatter } from '../core/gql_error_formatter';
+import { ServerLifeCycle } from '../core/server';
+import { GraphQLAPIConnector } from '../connectors/graphql';
 
 // tslint:disable-next-line:no-var-requires
 const DynamicMiddleware = require('dynamic-middleware');
@@ -46,6 +49,8 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
   private readonly fetcher: any;
   private readonly createDataLoaders: () => { [k: string]: DataLoader<any, any> };
   private schemaUrls: string[];
+  private retryOperations: { [key: string]: Retry };
+  private remoteSchemaVersions: { [key: string]: string };
 
   constructor(config: GraphQLBaseConfig) {
     this.path = config.path;
@@ -55,10 +60,16 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
     this.remoteSchemas = this.createRemoteSchemaMap(config.remoteSchemaUrls);
     this.createDataLoaders = config.createDataLoaders;
     this.schemaUrls = config.remoteSchemaUrls;
+    this.retryOperations = {};
+    this.remoteSchemaVersions = {};
+  }
+
+  get hasRemoteSchema() {
+    return Boolean(this.schemaUrls) && Boolean(this.schemaUrls.length);
   }
 
   public async initialize(app: express.Application) {
-    await this.resolveRemoteSchemas();
+    await this.resolveRemoteSchemas(this.remoteSchemas);
     this.refreshMiddleware();
     this.graphqlMiddleware.handler();
     this.server.applyMiddleware({ app, path: this.path });
@@ -66,27 +77,53 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
   }
 
   public isSchemaHealthy() {
-    return !this.schemaUrls || this.schemaUrls.every(url => !!this.remoteSchemas[url]);
+    return !this.hasRemoteSchema || this.schemaUrls.every(url => Boolean(this.remoteSchemas[url]));
   }
 
-  public async updateRemoteSchema(url: string) {
+  public async updateRemoteSchema(url: string, targetVersion?: string) {
     log.info(`Updating remote schema at ${url}`);
-    await this.addRemoteSchema(url);
-    this.refreshMiddleware();
+
+    // When passing a schema version if the version matches no need to update
+    if (this.isVersionCorrect(url, targetVersion)) {
+      return Promise.resolve();
+    }
+
+    this.sendFetchingEvent();
+
+    if (await this.addRemoteSchema(url, targetVersion)) {
+      this.refreshMiddleware();
+    }
+
+    this.shouldSendFetchingCompleted();
+    return Promise.resolve();
   }
 
   public getRemoteSchemaStatus(url: string) {
     return this.remoteSchemas[url] ? RemoteSchemaStatus.ACTIVE : RemoteSchemaStatus.INACTIVE;
   }
 
-  private async resolveRemoteSchemas() {
-    await Promise.all(Object.keys(this.remoteSchemas).map(url => this.addRemoteSchema(url)));
+  private isVersionCorrect(url: string, targetVersion: string) {
+    return Boolean(targetVersion) && this.remoteSchemaVersions[url] === targetVersion;
+  }
 
+  private async resolveRemoteSchemas(remoteSchemas: GraphQLSchemaMap) {
+    this.sendFetchingEvent();
+
+    await Promise.all(Object.keys(remoteSchemas).map(url => this.addRemoteSchema(url)));
+
+    this.shouldSendFetchingCompleted();
+
+    return Promise.resolve();
+  }
+
+  private sendFetchingEvent() {
+    this.publish(ServerLifeCycle.REMOTE_SCHEMAS_FETCHING);
+  }
+
+  private shouldSendFetchingCompleted() {
     if (this.isSchemaHealthy()) {
-      return Promise.resolve();
+      this.publish(ServerLifeCycle.REMOTE_SCHEMAS_FETCHED);
     }
-
-    return Promise.reject('Unable to resolve all remote schemas. Stopping GraphQL initilization...');
   }
 
   private requiredApolloConfigVariable(variableName: string) {
@@ -100,28 +137,87 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
     return value;
   }
 
-  private async addRemoteSchema(url: string) {
+  private async addRemoteSchema(url: string, targetVersion?: string) {
     const schema = await getIntrospectSchema(url, this.fetcher);
+    await this.updateRemoteSchemaVersion(url);
     this.remoteSchemas[url] = schema;
+
+    if (targetVersion) {
+      this.startRetryOperation(url, targetVersion);
+    }
+
+    return schema;
   }
 
   private refreshMiddleware() {
     log.info(`Refresh graphql middleware`);
     const schemas: GraphQLSchema[] = [];
+
     Object.keys(this.remoteSchemas).forEach(url => {
-      if (this.remoteSchemas[url]) {
-        schemas.push(this.remoteSchemas[url]);
+      const remoteSchema = this.remoteSchemas[url];
+      if (remoteSchema) {
+        schemas.push(remoteSchema);
         log.info(`Remote schema url: ${url}`);
         //  TODO: Export printing method from graphql utility in api/schema
         // log.info(`Schema: ${ print(this.remoteSchemas[url]) }`)
       } else {
-        log.warn(`Could not resolve schema for url ${url}`);
+        this.startRetryOperation(url);
       }
     });
     schemas.push(this.localSchema);
     const schema = schemas.length === 1 ? schemas[0] : mergeSchemas({ schemas });
     const schemaWithMiddleware = applyMiddleware(schema, ...this.graphqlMiddlewares);
     this.server = this.createServer(schemaWithMiddleware);
+  }
+
+  private async updateRemoteSchemaVersion(url: string) {
+    log.info(`Update schema version for ${url} with current version ${this.remoteSchemaVersions[url]}`);
+    const connector = new GraphQLAPIConnector({ customEndpoint: url, logTag: 'Schema Update', urls: {} });
+    try {
+      const response = await connector.query(Context.createEmpty(), `{ version }`);
+      log.info(`Update remote schema version response: ${JSON.stringify(response)}`);
+      this.remoteSchemaVersions[url] = response && response.version;
+    } catch (e) {
+      log.error(`Failed to get remote schema version for ${url}`, e);
+    }
+  }
+
+  private startRetryOperation(url: string, targetVersion?: string) {
+    const shouldRetryForRemoteSchema =
+      this.getRemoteSchemaStatus(url) === RemoteSchemaStatus.INACTIVE ||
+      (Boolean(targetVersion) && this.remoteSchemaVersions[url] !== targetVersion);
+
+    if (shouldRetryForRemoteSchema) {
+      const self = this;
+      const updateAttempt = () => self.updateRemoteSchema(url);
+
+      const check = () =>
+        (self.getRemoteSchemaStatus(url) === RemoteSchemaStatus.ACTIVE && !Boolean(targetVersion)) ||
+        (Boolean(targetVersion) && this.remoteSchemaVersions[url] === targetVersion);
+
+      const tag = `fetch remote schema at ${url}`;
+
+      const onStop = function(retriesExceeded: boolean) {
+        if (retriesExceeded) {
+          log.error(`Failed to get remote schema for ${url}`);
+          throw new NestedError('Ceres failed to get remote schema');
+        }
+      };
+
+      const retry = new Retry(
+        { asyncFunction: updateAttempt, check, tag, onStop },
+        { factor: 2, minTimeout: 1000, retries: 5 }
+      );
+
+      this.retryOperations[url] = retry;
+      retry.start();
+    } else {
+      const operation = this.retryOperations[url];
+      if (operation) {
+        log.info(`Stopping ongoing retry for ${url} after successful update`);
+        operation.stop();
+      }
+    }
   }
 
   private getAuthToken(req: express.Request) {
@@ -140,9 +236,11 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
 
   private createSchema(schemaString: string, resolver: IResolvers) {
     return makeExecutableSchema({
-      // No need to specify a `logger` here; it only logs GraphQL errors,
-      // (https://github.com/apollographql/graphql-tools/blob/master/src/makeExecutableSchema.ts#L68)
-      // which are already logged by the `ErrorReporter` in the `formatError` callback below.
+      logger: {
+        log: (message: string) => {
+          log.info(message);
+        }
+      },
       resolverValidationOptions: {
         requireResolversForResolveType: false
       },
@@ -197,29 +295,31 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
         }),
       formatError: (error: GraphQLError) => {
         let formattedError = error;
-
         try {
-          // Inherits any `isExpected` flag present on the `originalError`
           formattedError = GraphQLErrorFormatter.format(error);
         } catch (err) {
           log.error(`An unexpected error occurred while formatting the GraphQL error`, err);
         }
         const errorMessage = String(formattedError);
-        const { originalError } = formattedError; // Can be undefined
+        const { originalError } = error;
 
-        const extra = {
-          'GraphQL Body': _.get(formattedError, 'source.body', undefined)
-        };
+        // Kind of odd, but originalError can be undefined
+        if (_.get(originalError, 'isExpected', false)) {
+          log.info(`Trapped expected error: ${errorMessage}\n${formattedError}`);
+        } else {
+          log.error(errorMessage, formattedError);
 
-        if (originalError && originalError instanceof NestedError) {
-          Object.assign(extra, (originalError as NestedError).getSentryExtraData())
+          if (ErrorReporter.isInitialized()) {
+            ErrorReporter.capture(errorMessage, {
+              exception: formattedError,
+              extra: {
+                path: formattedError.path,
+                positions: formattedError.positions,
+                source: formattedError.source && formattedError.source.body
+              }
+            });
+          }
         }
-
-        // Implicitly logs the error to the console
-        ErrorReporter.capture(errorMessage, {
-          exception: formattedError,
-          extra
-        });
 
         return formattedError;
       },
@@ -227,6 +327,7 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
       playground: {
         endpoint: `${this.path}`,
         settings: {
+          'editor.cursorShape': 'line',
           'editor.fontFamily': undefined,
           'editor.fontSize': undefined,
           'editor.reuseHeaders': true,
@@ -239,6 +340,10 @@ export abstract class GraphQLBase implements Initializable<express.Application> 
       schema,
       tracing: Boolean(process.env.DEBUG_RESOLVER_TRACING)
     });
+  }
+
+  private publish(lifeCycleEvent: ServerLifeCycle) {
+    pubsub.publish(`IA.api.server.${lifeCycleEvent}`, this);
   }
 }
 
